@@ -105,25 +105,11 @@ audio_map/
 ├── cli.py             # Command-line interface
 ├── build.py           # Audio processing and map building
 └── runtime.py         # Real-time navigation and playback
-
-examples/
-└── arc.py             # Basic Arc controller test
-
-audio_files/           # Sample audio files
-└── *.wav
 ```
 
 ## License
 
 MIT License
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests and code quality checks
-5. Submit a pull request
 
 ## Links
 
