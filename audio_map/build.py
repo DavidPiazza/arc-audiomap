@@ -26,6 +26,48 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore", category=(UserWarning))
 warnings.filterwarnings("ignore", category=(FutureWarning))
 
+def load_whole_audio(
+    file_path: str,
+    target_sr: int = 22050
+) -> np.ndarray:
+    """Load an entire audio file, convert to mono, and resample.
+    
+    Args:
+        file_path: Path to the audio file
+        target_sr: Target sample rate (default: 22050 Hz)
+        
+    Returns:
+        Audio as numpy array
+        
+    Raises:
+        RuntimeError: If the audio file cannot be loaded
+        FileNotFoundError: If the audio file doesn't exist
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Audio file not found: {file_path}")
+        
+    try:
+        # Load audio file with torchaudio
+        waveform, original_sr = torchaudio.load(file_path)
+        
+        # Convert to mono if stereo
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+        # Resample if necessary
+        if original_sr != target_sr:
+            resampler = T.Resample(orig_freq=original_sr, new_freq=target_sr)
+            waveform = resampler(waveform)
+            
+        # Convert to numpy array and squeeze to 1D
+        audio = waveform.squeeze().numpy()
+        
+        return audio
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to load audio file {file_path}: {e}")
+
+
 def load_and_slice_audio(
     file_path: str, 
     target_sr: int = 22050, 
@@ -414,19 +456,72 @@ def reduce_dimensions(features: np.ndarray, max_samples: int = 50000) -> np.ndar
             raise RuntimeError(f"Both UMAP and PCA failed. UMAP error: {e}, PCA error: {e2}")
 
 
-def process_audio_file(args: Tuple[str, float, str]) -> Tuple[List[np.ndarray], List[str], List[float], int, Optional[str]]:
+def process_audio_file_no_slice(args: Tuple[str, str]) -> Tuple[List[np.ndarray], List[str], List[float], List[float], int, Optional[str]]:
+    """Process a single audio file as one slice for feature extraction.
+    
+    Args:
+        args: Tuple of (file_path, feature_mode)
+        
+    Returns:
+        Tuple of (features, paths, slice_times, durations, silent_count, skip_reason)
+    """
+    file_path, feature_mode = args
+    features = []
+    paths = []
+    slice_times = []
+    durations = []
+    silent_count = 0
+    skip_reason = None
+    
+    try:
+        # Load whole audio file
+        audio = load_whole_audio(file_path)
+        
+        # In no-slice mode, we accept files of any length
+        # (no minimum length check)
+        
+        # Check if silent
+        if is_silent(audio):
+            silent_count = 1
+            skip_reason = "Silent file"
+            return features, paths, slice_times, durations, silent_count, skip_reason
+        
+        try:
+            # Extract features based on mode
+            if feature_mode == 'fast':
+                file_features = extract_features_fast(audio)
+            elif feature_mode == 'optimized':
+                file_features = extract_features_optimized(audio)
+            else:
+                file_features = extract_features(audio)
+                
+            features.append(file_features)
+            paths.append(str(file_path))
+            slice_times.append(0.0)  # Whole file starts at time 0
+            durations.append(len(audio) / 22050.0)  # Duration in seconds
+        except Exception as feat_error:
+            skip_reason = f"Feature extraction error: {str(feat_error)}"
+            
+    except Exception as e:
+        skip_reason = f"Loading error: {str(e)}"
+        
+    return features, paths, slice_times, durations, silent_count, skip_reason
+
+
+def process_audio_file(args: Tuple[str, float, str]) -> Tuple[List[np.ndarray], List[str], List[float], List[float], int, Optional[str]]:
     """Process a single audio file for multiprocessing.
     
     Args:
         args: Tuple of (file_path, slice_duration, feature_mode)
         
     Returns:
-        Tuple of (features, paths, slice_times, silent_count, skip_reason)
+        Tuple of (features, paths, slice_times, durations, silent_count, skip_reason)
     """
     file_path, slice_duration, feature_mode = args
     features = []
     paths = []
     slice_times = []
+    durations = []
     silent_count = 0
     skip_reason = None
     
@@ -437,7 +532,7 @@ def process_audio_file(args: Tuple[str, float, str]) -> Tuple[List[np.ndarray], 
         # Check if we got any valid slices
         if not slices:
             skip_reason = f"Too short (< {slice_duration}s)"
-            return features, paths, slice_times, silent_count, skip_reason
+            return features, paths, slice_times, durations, silent_count, skip_reason
         
         # Extract features for each slice
         for slice_idx, slice_data in enumerate(slices):
@@ -458,6 +553,7 @@ def process_audio_file(args: Tuple[str, float, str]) -> Tuple[List[np.ndarray], 
                 features.append(slice_features)
                 paths.append(str(file_path))
                 slice_times.append(slice_idx * slice_duration)
+                durations.append(slice_duration)  # Each slice has fixed duration
             except Exception as feat_error:
                 # Skip this slice if feature extraction fails
                 skip_reason = f"Feature extraction error: {str(feat_error)}"
@@ -467,12 +563,12 @@ def process_audio_file(args: Tuple[str, float, str]) -> Tuple[List[np.ndarray], 
         # Return empty results on error (will be filtered out)
         skip_reason = f"Loading error: {str(e)}"
         
-    return features, paths, slice_times, silent_count, skip_reason
+    return features, paths, slice_times, durations, silent_count, skip_reason
 
 
 def build_map(folder_path: str, output_path: str = "map.pkl", slice_duration: float = 0.5, 
               max_points: Optional[int] = None, num_workers: Optional[int] = None, 
-              fast_mode: bool = False) -> dict:
+              fast_mode: bool = False, no_slice: bool = False) -> dict:
     """Build the audio map from a folder of audio files.
     
     Args:
@@ -482,6 +578,7 @@ def build_map(folder_path: str, output_path: str = "map.pkl", slice_duration: fl
         max_points: Maximum number of points to include in the map (default: None for no limit)
         num_workers: Number of parallel workers (default: None for auto-detect)
         fast_mode: Use fast feature extraction (10 dims instead of 28)
+        no_slice: Treat each file as a single slice (default: False)
         
     Returns:
         Dictionary containing the map data
@@ -508,36 +605,44 @@ def build_map(folder_path: str, output_path: str = "map.pkl", slice_duration: fl
     typer.echo(f"Processing with {num_workers} parallel workers...")
     if fast_mode:
         typer.echo("Fast mode enabled: using simplified 10-dimensional features")
+    if no_slice:
+        typer.echo("No-slice mode: treating each file as a single slice")
     
     # Prepare arguments for multiprocessing
     feature_mode = 'fast' if fast_mode else 'optimized'
-    process_args = [(file_path, slice_duration, feature_mode) for file_path in audio_files]
+    if no_slice:
+        process_args = [(file_path, feature_mode) for file_path in audio_files]
+        process_func = process_audio_file_no_slice
+    else:
+        process_args = [(file_path, slice_duration, feature_mode) for file_path in audio_files]
+        process_func = process_audio_file
     
     # Process files in parallel
     all_features = []
     all_paths = []
     all_slice_times = []
+    all_durations = []
     slice_count = 0
     silent_count = 0
-    skipped_files = []
     skip_reasons = {}
     
     # Use multiprocessing with progress bar
     with mp.Pool(processes=num_workers) as pool:
         # Process with tqdm progress bar
         results = list(tqdm(
-            pool.imap_unordered(process_audio_file, process_args),
+            pool.imap_unordered(process_func, process_args),
             total=len(audio_files),
             desc="Processing audio files",
             unit="files"
         ))
         
         # Aggregate results
-        for features, paths, times, silent, skip_reason in results:
+        for features, paths, times, durations, silent, skip_reason in results:
             if features:  # Only add if processing succeeded
                 all_features.extend(features)
                 all_paths.extend(paths)
                 all_slice_times.extend(times)
+                all_durations.extend(durations)
                 slice_count += len(features)
                 silent_count += silent
             elif skip_reason:  # Track skipped files
@@ -620,6 +725,7 @@ def build_map(folder_path: str, output_path: str = "map.pkl", slice_duration: fl
         'coords': coords.astype(np.float32),
         'paths': all_paths,
         'slice_times': all_slice_times,
+        'durations': all_durations,
         'kdtree': kdtree,  # Save the KDTree if available
         'metadata': {
             'total_files': len(audio_files),
@@ -627,7 +733,8 @@ def build_map(folder_path: str, output_path: str = "map.pkl", slice_duration: fl
             'silent_slices_discarded': silent_count,
             'files_skipped': sum(skip_reasons.values()),
             'skip_reasons': skip_reasons,
-            'slice_duration': slice_duration,
+            'slice_duration': slice_duration if not no_slice else None,
+            'no_slice_mode': no_slice,
             'feature_dimensions': feature_array.shape[1],
             'build_time': time.time() - start_time,
             'kdtree_built': kdtree_built

@@ -31,6 +31,11 @@ def build(
         min=0.01,
         max=10.0
     ),
+    no_slice: bool = typer.Option(
+        False,
+        "--no-slice",
+        help="Treat each file as a single slice (no slicing)"
+    ),
     max_points: int = typer.Option(
         None,
         "--max-points",
@@ -57,7 +62,7 @@ def build(
     
     This command recursively scans the specified folder for audio files, processes each file by:
     - Converting to mono at 22,050 Hz sample rate
-    - Slicing into non-overlapping segments (default: 0.5 seconds, configurable)
+    - Slicing into non-overlapping segments (default: 0.5 seconds, configurable) OR treating each file as one slice
     - Extracting 28-dimensional feature vectors (MFCC, chroma, spectral features)
     - Reducing dimensionality to 2D coordinates using UMAP
     - Saving the resulting map as 'map.pkl' in the current directory
@@ -65,6 +70,7 @@ def build(
     Examples:
         audio_navigator build ~/Music/samples
         audio_navigator build ~/Music/samples --slice-duration 1.0
+        audio_navigator build ~/Music/samples --no-slice
     """
     # Validate that the folder exists and is a directory
     if not folder.exists():
@@ -83,7 +89,8 @@ def build(
             slice_duration=slice_duration, 
             max_points=max_points,
             num_workers=num_workers,
-            fast_mode=fast_mode
+            fast_mode=fast_mode,
+            no_slice=no_slice
         )
     except ImportError:
         typer.echo("Error: Build module not yet implemented", err=True)

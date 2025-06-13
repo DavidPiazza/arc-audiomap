@@ -215,15 +215,21 @@ class AudioPlayer:
         self.crossfade_position = 0
         self.is_playing = False
         self.is_crossfading = False
+        self.fade_samples = int(0.005 * self.sample_rate)  # 5ms fade in/out to prevent clicks
         self.stream = None
         self.audio_cache = LRUCache(max_size_mb=200)  # 200MB LRU cache for audio
         self.playback_queue = deque(maxlen=8)  # For mode 1 (morphing between k nearest)
-        self.current_mode = 0  # 0: single, 1: morph
+        self.current_mode = 0  # 0: single, 1: poly, 2: morph
         self.buffer_size = 256  # Smaller buffer for lower latency
         
         # For morph mode - multiple simultaneous sources
         self.morph_sources = []  # List of (audio_data, position, amplitude) tuples
         self.morph_lock = threading.Lock()
+        
+        # For poly mode - up to 16 voices with voice stealing
+        self.poly_voices = []  # List of (audio_data, position, amplitude, start_time) tuples
+        self.poly_lock = threading.Lock()
+        self.max_poly_voices = 16
         
         # Playback rate control (handled in real-time during callback)
         self.playback_rate = 1.0
@@ -288,15 +294,60 @@ class AudioPlayer:
             return np.zeros(int(duration * self.sample_rate))
     
     def callback(self, outdata, frames, time, status):
-        """Audio callback for sounddevice with crossfading and morph support."""
+        """Audio callback for sounddevice with crossfading, poly, and morph support."""
         if status:
             print(f"Audio callback status: {status}")
         
         # Fill with zeros by default
         outdata.fill(0)
         
+        # Handle poly mode - mix multiple voices with voice management
+        if self.current_mode == 1 and self.poly_voices:
+            with self.poly_lock:
+                # Mix all poly voices
+                for i in range(frames):
+                    mixed_sample = 0.0
+                    voices_to_remove = []
+                    
+                    for idx, (audio_data, position, amplitude, start_time) in enumerate(self.poly_voices):
+                        if position < len(audio_data):
+                            # Calculate envelope for fade-in/fade-out
+                            envelope = 1.0
+                            
+                            # Fade in at start
+                            if position < self.fade_samples:
+                                envelope = position / self.fade_samples
+                            
+                            # Fade out at end
+                            remaining_samples = len(audio_data) - position
+                            if remaining_samples < self.fade_samples:
+                                envelope = remaining_samples / self.fade_samples
+                            
+                            # Add this voice's contribution with envelope
+                            mixed_sample += audio_data[int(position)] * amplitude * envelope
+                            # Update position with rate control
+                            new_position = position + self.playback_rate
+                            self.poly_voices[idx] = (audio_data, new_position, amplitude, start_time)
+                        else:
+                            # Mark for removal if at end (no looping in poly mode)
+                            voices_to_remove.append(idx)
+                    
+                    # Remove finished voices
+                    for idx in reversed(voices_to_remove):
+                        self.poly_voices.pop(idx)
+                    
+                    # Apply soft clipping to prevent distortion
+                    if mixed_sample > 1.0:
+                        mixed_sample = 1.0 - (2.0 / (1.0 + np.exp(2.0 * mixed_sample)))
+                    elif mixed_sample < -1.0:
+                        mixed_sample = -1.0 + (2.0 / (1.0 + np.exp(-2.0 * mixed_sample)))
+                    
+                    outdata[i, 0] = mixed_sample
+            
+            return
+        
         # Handle morph mode - mix multiple sources
-        if self.current_mode == 1 and self.morph_sources:
+        elif self.current_mode == 2 and self.morph_sources:
             with self.morph_lock:
                 # Mix all morph sources
                 for i in range(frames):
@@ -305,8 +356,20 @@ class AudioPlayer:
                     
                     for idx, (audio_data, position, amplitude) in enumerate(self.morph_sources):
                         if position < len(audio_data):
-                            # Add this source's contribution scaled by amplitude
-                            mixed_sample += audio_data[int(position)] * amplitude
+                            # Calculate envelope for fade-in/fade-out
+                            envelope = 1.0
+                            
+                            # Fade in at start
+                            if position < self.fade_samples:
+                                envelope = position / self.fade_samples
+                            
+                            # Fade out at end
+                            remaining_samples = len(audio_data) - position
+                            if remaining_samples < self.fade_samples:
+                                envelope = remaining_samples / self.fade_samples
+                            
+                            # Add this source's contribution scaled by amplitude and envelope
+                            mixed_sample += audio_data[int(position)] * amplitude * envelope
                             # Update position with rate control
                             new_position = position + self.playback_rate
                             self.morph_sources[idx] = (audio_data, new_position, amplitude)
@@ -344,15 +407,24 @@ class AudioPlayer:
                     # Crossfade ratio (0 to 1)
                     fade_ratio = self.crossfade_position / self.crossfade_samples
                     
-                    # Get current audio sample (with rate control)
+                    # Get current audio sample (with rate control and fade envelope)
                     current_sample = 0.0
                     if int(self.position) < len(self.current_audio):
-                        current_sample = self.current_audio[int(self.position)]
+                        sample = self.current_audio[int(self.position)]
+                        # Apply fade out envelope for current audio
+                        remaining = len(self.current_audio) - self.position
+                        if remaining < self.fade_samples:
+                            sample *= remaining / self.fade_samples
+                        current_sample = sample
                     
-                    # Get next audio sample (with rate control)
+                    # Get next audio sample (with rate control and fade envelope)
                     next_sample = 0.0
                     if int(self.crossfade_position) < len(self.next_audio):
-                        next_sample = self.next_audio[int(self.crossfade_position)]
+                        sample = self.next_audio[int(self.crossfade_position)]
+                        # Apply fade in envelope for next audio
+                        if self.crossfade_position < self.fade_samples:
+                            sample *= self.crossfade_position / self.fade_samples
+                        next_sample = sample
                     
                     # Crossfade: fade out current, fade in next
                     mixed_sample = current_sample * (1.0 - fade_ratio) + next_sample * fade_ratio
@@ -372,17 +444,37 @@ class AudioPlayer:
         else:
             # Normal playback with real-time rate control
             if self.position >= len(self.current_audio):
-                self.is_playing = False
-                return
-            
-            # Sample-by-sample playback with rate control
-            for i in range(frames):
-                if int(self.position) < len(self.current_audio):
-                    outdata[i, 0] = self.current_audio[int(self.position)]
-                    self.position += self.playback_rate
+                if self.loop_enabled and self.current_audio is not None:
+                    # Loop back to start
+                    self.position = 0
                 else:
                     self.is_playing = False
-                    break
+                    return
+            
+            # Sample-by-sample playback with rate control and fade envelope
+            for i in range(frames):
+                if int(self.position) < len(self.current_audio):
+                    # Calculate envelope for fade-in/fade-out
+                    envelope = 1.0
+                    
+                    # Fade in at start
+                    if self.position < self.fade_samples:
+                        envelope = self.position / self.fade_samples
+                    
+                    # Fade out at end
+                    remaining_samples = len(self.current_audio) - self.position
+                    if remaining_samples < self.fade_samples:
+                        envelope = remaining_samples / self.fade_samples
+                    
+                    outdata[i, 0] = self.current_audio[int(self.position)] * envelope
+                    self.position += self.playback_rate
+                else:
+                    if self.loop_enabled:
+                        # Loop back to start
+                        self.position = 0
+                    else:
+                        self.is_playing = False
+                        break
     
     def start_stream(self):
         """Start the audio stream with optimized settings."""
@@ -465,13 +557,50 @@ class AudioPlayer:
             self.play_audio(file_path, start_time, duration)
     
     def set_mode(self, mode):
-        """Set playback mode (0: single, 1: morph)."""
+        """Set playback mode (0: single, 1: poly, 2: morph)."""
         self.current_mode = mode
         self.playback_queue.clear()
         if mode == 1:
+            # Clear poly voices when switching to poly mode
+            with self.poly_lock:
+                self.poly_voices.clear()
+        elif mode == 2:
             # Clear morph sources when switching to morph mode
             with self.morph_lock:
                 self.morph_sources.clear()
+    
+    def add_poly_voice(self, file_path, start_time=0, duration=1.0):
+        """Add a new voice to the poly mode playback.
+        
+        Args:
+            file_path: Path to audio file
+            start_time: Start time in seconds
+            duration: Duration in seconds
+        """
+        if self.current_mode != 1:
+            return
+            
+        audio_data = self.load_audio(file_path, start_time, duration)
+        
+        with self.poly_lock:
+            import time
+            current_time = time.time()
+            
+            # Apply voice stealing if at maximum voices
+            if len(self.poly_voices) >= self.max_poly_voices:
+                # Remove the oldest voice (FIFO voice stealing)
+                oldest_idx = 0
+                oldest_time = self.poly_voices[0][3] if self.poly_voices else current_time
+                
+                for idx, (_, _, _, start_time) in enumerate(self.poly_voices):
+                    if start_time < oldest_time:
+                        oldest_time = start_time
+                        oldest_idx = idx
+                
+                self.poly_voices.pop(oldest_idx)
+            
+            # Add new voice with full amplitude
+            self.poly_voices.append((audio_data, 0, 1.0, current_time))
     
     def set_playback_rate(self, rate):
         """Set the playback rate for real-time rate control.
@@ -488,7 +617,7 @@ class AudioPlayer:
             sources_with_distances: List of tuples (file_path, start_time, duration, distance)
             rate: Playback rate multiplier (affects both speed and pitch)
         """
-        if self.current_mode != 1:
+        if self.current_mode != 2:
             return
         
         # Set the playback rate for real-time control
@@ -523,7 +652,7 @@ class AudioPlayer:
     def update(self):
         """Update playback state."""
         # Morph mode: restart sources only if looping is enabled
-        if self.current_mode == 1:
+        if self.current_mode == 2:
             with self.morph_lock:
                 new_sources = []
                 for audio_data, position, amplitude in self.morph_sources:
@@ -552,7 +681,7 @@ class mapApp(ArcApp):
         self.cursor_x = 0.0  # Cursor position in [-1, 1] range
         self.cursor_y = 0.0
         self.zoom_level = 1.0  # Zoom level (0.1 to 10.0)
-        self.playback_mode = 0  # 0: single nearest, 1: morph between k nearest
+        self.playback_mode = 0  # 0: single nearest, 1: poly, 2: morph between k nearest
         
         # Interaction parameters
         self.movement_speed = 0.02  # How fast cursor moves per encoder delta
@@ -609,6 +738,16 @@ class mapApp(ArcApp):
             for key in required_keys:
                 if key not in self.map_data:
                     raise ValueError(f"Map missing required key: {key}")
+            
+            # Check if durations are available (for variable-length slices)
+            if 'durations' not in self.map_data:
+                # For backward compatibility, assume fixed duration from metadata
+                if 'metadata' in self.map_data and 'slice_duration' in self.map_data['metadata']:
+                    fixed_duration = self.map_data['metadata']['slice_duration']
+                    self.map_data['durations'] = [fixed_duration] * len(self.map_data['paths'])
+                else:
+                    # Default to 0.5 seconds if no duration info available
+                    self.map_data['durations'] = [0.5] * len(self.map_data['paths'])
             
             print(f"Map loaded: {self.map_data['metadata']['total_slices']} audio slices")
             
@@ -686,7 +825,8 @@ class mapApp(ArcApp):
                         'distance': distances[i],
                         'coord': self.map_data['coords'][idx],
                         'path': self.map_data['paths'][idx],
-                        'slice_time': self.map_data['slice_times'][idx]
+                        'slice_time': self.map_data['slice_times'][idx],
+                        'duration': self.map_data['durations'][idx]
                     })
                 
                 return results
@@ -711,7 +851,8 @@ class mapApp(ArcApp):
                 'distance': distances[idx],
                 'coord': coords[idx],
                 'path': self.map_data['paths'][idx],
-                'slice_time': self.map_data['slice_times'][idx]
+                'slice_time': self.map_data['slice_times'][idx],
+                'duration': self.map_data['durations'][idx]
             })
         
         return results
@@ -879,7 +1020,7 @@ class mapApp(ArcApp):
         
         nearest_points = self.find_nearest_points(
             self.cursor_x, self.cursor_y,
-            k=self.k_nearest if self.playback_mode == 1 else 1
+            k=self.k_nearest if self.playback_mode == 2 else 1
         )
 
         if not nearest_points:
@@ -897,21 +1038,33 @@ class mapApp(ArcApp):
             self.audio_player.play_audio(
                 point['path'], 
                 point['slice_time'], 
-                duration=1.0,
+                duration=point['duration'],
                 rate=self.playback_rate
             )
             self.last_audio_change = current_time
             self.last_cursor_pos = (self.cursor_x, self.cursor_y)
             self.last_nearest_indices = new_indices
         
-        else:  # Morph mode
+        elif self.playback_mode == 1:  # Poly mode
+            # Add new voice for the nearest point
+            point = nearest_points[0]
+            self.audio_player.add_poly_voice(
+                point['path'],
+                point['slice_time'],
+                point['duration']
+            )
+            self.last_audio_change = current_time
+            self.last_cursor_pos = (self.cursor_x, self.cursor_y)
+            self.last_nearest_indices = new_indices
+        
+        else:  # Morph mode (mode 2)
             # Set up multiple sources with distance-based amplitudes
             sources_with_distances = []
             for point in nearest_points:
                 sources_with_distances.append((
                     point['path'],
                     point['slice_time'],
-                    1.0,  # duration
+                    point['duration'],
                     point['distance']
                 ))
             
@@ -997,19 +1150,27 @@ class mapApp(ArcApp):
         print("Arc connected - arc-navigator ready")
         print("Ring 0: X position | Ring 1: Y position")
         print("Ring 2: Zoom level | Ring 3: Playback rate (varispeed)")
-        print(f"Mode: {'morph' if self.playback_mode else 'single'}")
+        mode_names = ['single', 'poly', 'morph']
+        print(f"Mode: {mode_names[self.playback_mode]}")
         print(f"Initial playback rate: {self.playback_rate:.2f}x (affects speed and pitch)")
         print(f"Morph neighbors: {self.k_nearest}")
         print(f"Looping {'enabled' if self.loop_enabled else 'disabled'}")
     
     async def on_button_press(self):
-        """Handle button press to toggle playback mode."""
-        self.playback_mode = 1 - self.playback_mode
+        """Handle button press to cycle through playback modes."""
+        # Cycle through modes: 0 -> 1 -> 2 -> 0
+        self.playback_mode = (self.playback_mode + 1) % 3
         self.audio_player.set_mode(self.playback_mode)
-        if self.playback_mode == 1:
-            print(f"Playback mode: morph (using {self.k_nearest} nearest neighbors)")
-        else:
-            print("Playback mode: single")
+        
+        mode_names = ['single', 'poly', 'morph']
+        mode_descriptions = {
+            0: "single (monophonic, immediate cutoff)",
+            1: "poly (up to 16 voices, no cutoff)",
+            2: f"morph (blend {self.k_nearest} nearest neighbors)"
+        }
+        
+        print(f"Playback mode: {mode_descriptions[self.playback_mode]}")
+        
         # Reset nearest tracking so next update triggers playback for new mode
         self.last_nearest_indices = tuple()
     
@@ -1036,12 +1197,14 @@ class mapApp(ArcApp):
         if current_time - self.last_perf_report > 5.0:
             if self.density_calc_count > 0:
                 avg_density_time = self.density_calc_time / self.density_calc_count
+                mode_names = ['single', 'poly', 'morph']
                 print(f"Performance: Avg density calc: {avg_density_time:.2f}ms, "
                       f"Points in view: {self._last_points_in_view}, "
                       f"Cache size: {self.audio_player.audio_cache.current_size_bytes / 1024 / 1024:.1f}MB, "
                       f"Using: {'KDTree' if self.kdtree is not None else 'Brute-force'}, "
                       f"Cursor: ({self.cursor_x:.2f}, {self.cursor_y:.2f}), Zoom: {self.zoom_level:.2f}, "
                       f"Rate: {self.playback_rate:.2f}x{'*' if self.showing_rate_dial else ''}, "
+                      f"Mode: {mode_names[self.playback_mode]}, "
                       f"Neighbors: {self.k_nearest}")
             self.last_perf_report = current_time
     
@@ -1061,9 +1224,10 @@ def run_navigator(map_path, device_id=None, neighbors=8, loop=False):
     """
     # Re-check scipy availability at runtime
     try:
-        from scipy.spatial import cKDTree as test_import
+        from scipy import spatial
+        _ = spatial.cKDTree
         print("✓ scipy.spatial.cKDTree verified at runtime")
-    except ImportError as e:
+    except (ImportError, AttributeError) as e:
         print(f"ERROR: scipy not available at runtime: {e}")
     
     try:
