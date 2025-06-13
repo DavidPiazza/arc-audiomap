@@ -1,6 +1,6 @@
 # Audio Map
 
-Audio sample exploration and analysis tool using monome controllers
+Corpus exploration and analysis tool using the monome arc
 
 ## Overview
 
@@ -10,7 +10,7 @@ Audio Map is an interactive tool for exploring large collections of audio sample
 
 - **Audio Processing**: Converts audio files to mono at 22,050 Hz and slices them into configurable segments
 - **Feature Extraction**: Extracts 28-dimensional feature vectors including MFCC, chroma, and spectral features
-- **Dimensionality Reduction**: Uses UMAP to create 2D maps
+- **Dimensionality Reduction**: Uses UMAP to create 2D embedding maps
 - **Real-time Navigation**: Interactive exploration using monome Arc controller
 
 ## Requirements
